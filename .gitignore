@@ -208,3 +208,6 @@ __marimo__/
 
 # Files
 .DS_Store
+
+# Data
+data/

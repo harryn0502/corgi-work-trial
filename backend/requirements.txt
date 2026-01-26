@@ -4,3 +4,6 @@ djangorestframework
 python-dotenv
 psycopg[binary]
 openai
+pandas
+pypdf
+python-docx
