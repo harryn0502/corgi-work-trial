@@ -1,5 +1,4 @@
 import json
-from django.http import JsonResponse
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -9,11 +8,12 @@ from api.utils.file_loader import EvidenceLoader
 from api.ai_service import query_ai
 
 
-def health_check(request):
-    return JsonResponse({"status": "ok", "message": "Django is talking to React!"})
+class HealthView(APIView):
+    def get(self, request):
+        return Response({"message": "Django is talking to React!"}, status=status.HTTP_200_OK)
 
 
-class BatchAnalyzeView(APIView):
+class AnalyzeView(APIView):
     def post(self, request):
         # Get tracking numbers and split them into each number
         raw_ids = request.data.get("tracking_numbers", "")
@@ -86,18 +86,10 @@ class BatchAnalyzeView(APIView):
                         estimation = 0
                         reasoning = "Failed to parse JSON"
 
-                    # Calculate Stats
-                    ground_truth = float(claim.ground_truth_amount or 0)
-                    diff = abs(estimation - ground_truth)
-                    error_rate = (diff / ground_truth * 100) if ground_truth > 0 else 0
-
                     iterations.append(
                         {
-                            "step": i,
+                            "iteration": i,
                             "estimate": estimation,
-                            "ground_truth": ground_truth,
-                            "difference": diff,
-                            "error_rate": error_rate,
                             "reasoning": reasoning,
                         }
                     )
@@ -115,7 +107,6 @@ class BatchAnalyzeView(APIView):
                     {
                         "tracking_number": t_id,
                         "ground_truth": claim.ground_truth_amount,
-                        "final_estimate": current_estimate,
                         "iterations": iterations,
                     }
                 )
