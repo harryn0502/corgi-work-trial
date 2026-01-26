@@ -1,0 +1,6 @@
+Django
+django-cors-headers
+djangorestframework
+python-dotenv
+psycopg[binary]
+openai
