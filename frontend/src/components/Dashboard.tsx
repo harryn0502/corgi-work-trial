@@ -9,12 +9,16 @@ import {
   Box,
   CircularProgress,
   Stack,
+  LinearProgress,
+  CardContent,
+  Card,
+  Chip,
 } from "@mui/material";
 import Grid from "@mui/material/Grid";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import AnalyticsIcon from "@mui/icons-material/Analytics";
+import UpdateIcon from "@mui/icons-material/Update";
 
-import api from "../api";
 import Table from "./Table";
 import Graph from "./Graph";
 import type { Results } from "../types/types";
@@ -24,9 +28,18 @@ interface FormInputs {
   iteration_count: number;
 }
 
+interface StreamStatus {
+  totalSteps: number;
+  completedSteps: number;
+  currentIteration: number;
+  lastProcessedId: string;
+  lastEstimate: number;
+}
+
 export default function Dashboard() {
   const [results, setResults] = useState<Results[]>([]);
   const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<StreamStatus | null>(null);
 
   const {
     register,
@@ -39,22 +52,113 @@ export default function Dashboard() {
     },
   });
 
+  // Helper to merge streaming data to existing results
+  const updateResults = (prevResults: Results[], newData: Results) => {
+    const existingIndex = prevResults.findIndex(
+      (r) => r.tracking_number === newData.tracking_number,
+    );
+
+    if (existingIndex >= 0) {
+      // Update existing row
+      const updated = [...prevResults];
+      updated[existingIndex] = newData;
+      return updated;
+    } else {
+      // Add new row
+      return [...prevResults, newData];
+    }
+  };
+
   const onSubmit: SubmitHandler<FormInputs> = async (data) => {
     setLoading(true);
     setResults([]);
+
+    // Compute the total steps for progress bar
+    const trackingIds = data.tracking_numbers.split(",").filter((x) => x.trim());
+    const totalSteps = trackingIds.length * data.iteration_count;
+
+    setStatus({
+      totalSteps,
+      completedSteps: 0,
+      currentIteration: 0,
+      lastProcessedId: "Starting...",
+      lastEstimate: 0,
+    });
+
     try {
-      const res = await api.post("/api/analyze/", {
-        tracking_numbers: data.tracking_numbers,
-        iteration_count: data.iteration_count,
+      const response = await fetch(`${import.meta.env.VITE_API_URL}/api/analyze/`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          tracking_numbers: data.tracking_numbers,
+          iteration_count: data.iteration_count,
+        }),
       });
-      setResults(res.data);
+
+      if (!response.body) throw new Error("No response body");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+
+      // Read loop
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        // Decode chunk and add to buffer
+        buffer += decoder.decode(value, { stream: true });
+
+        // Split by newline
+        const parts = buffer.split("\n");
+
+        // In case last part might be incomplete keep it in the buffer
+        buffer = parts.pop() || "";
+
+        for (const part of parts) {
+          if (part.trim()) {
+            try {
+              const jsonChunk: Results = JSON.parse(part);
+
+              // Get latest iteration number for this chunk
+              const lastIter = jsonChunk.iterations[jsonChunk.iterations.length - 1];
+              const currentIterNum = lastIter ? lastIter.iteration : 1;
+
+              // Update progress state
+              setStatus((prev) => {
+                if (!prev) return null;
+                return {
+                  ...prev,
+                  completedSteps: prev.completedSteps + 1,
+                  currentIteration: currentIterNum,
+                  lastProcessedId: jsonChunk.tracking_number,
+                  lastEstimate:
+                    jsonChunk.iterations[jsonChunk.iterations.length - 1]?.estimate || 0,
+                };
+              });
+
+              // Update results data
+              setResults((prev) => updateResults(prev, jsonChunk));
+            } catch (e) {
+              console.error("Error parsing JSON chunk:", e);
+            }
+          }
+        }
+      }
     } catch (error) {
       console.error(error);
-      alert("Failed analyzing. Check backend console for details.");
+      alert("Stream failed. Check console.");
     } finally {
       setLoading(false);
     }
   };
+
+  // Calculate progress percentage
+  const progressPercent = status
+    ? Math.min((status.completedSteps / status.totalSteps) * 100, 100)
+    : 0;
 
   return (
     <Container maxWidth="xl" sx={{ mt: 4, mb: 4 }}>
@@ -122,6 +226,43 @@ export default function Dashboard() {
           </Grid>
         </Box>
       </Paper>
+
+      {loading && status && (
+        <Card variant="outlined" sx={{ mb: 4, borderColor: "primary.main", bgcolor: "#f5f9ff" }}>
+          <CardContent>
+            <Stack direction="row" spacing={2} alignItems="center" mb={1}>
+              <UpdateIcon color="primary" className="spin-animation" />
+              <Typography variant="h6" color="primary" fontWeight="bold">
+                Processing Cycle: Iteration {status.currentIteration}
+              </Typography>
+              <Chip label={`Latest: ID #${status.lastProcessedId}`} color="primary" size="small" />
+              <Chip
+                label={`Est: $${status.lastEstimate.toLocaleString()}`}
+                variant="outlined"
+                size="small"
+              />
+            </Stack>
+
+            <Box sx={{ display: "flex", alignItems: "center" }}>
+              <Box sx={{ width: "100%", mr: 1 }}>
+                <LinearProgress
+                  variant="determinate"
+                  value={progressPercent}
+                  sx={{ height: 10, borderRadius: 5 }}
+                />
+              </Box>
+              <Box sx={{ minWidth: 35 }}>
+                <Typography variant="body2" color="text.secondary">
+                  {Math.round(progressPercent)}%
+                </Typography>
+              </Box>
+            </Box>
+            <Typography variant="caption" color="text.secondary">
+              Processed {status.completedSteps} of {status.totalSteps} total operations...
+            </Typography>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Results Section */}
       {results.length > 0 && (
