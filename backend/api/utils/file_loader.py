@@ -46,8 +46,8 @@ class EvidenceLoader:
                 except:
                     pass
 
-            # Text/RMD
-            elif filename.lower().endswith((".rmd", ".txt", ".csv")):
+            # Text Files
+            elif filename.lower().endswith(".txt"):
                 try:
                     with open(file_path, "r", errors="ignore") as f:
                         results["text_context"] += f"\n[FILE: {filename}]\n{f.read()}\n"
@@ -58,19 +58,19 @@ class EvidenceLoader:
 
     def _process_pdf(self, file_path, filename, results):
         try:
+            # Extract Text
             reader = PdfReader(file_path)
             extracted_text = "".join([p.extract_text() or "" for p in reader.pages])
 
-            # If it has meaning text, use the text
-            if len(extracted_text.strip()) > 50:
-                results["text_context"] += f"\n[FILE: {filename}]\n{extracted_text}\n"
-                return
+            if extracted_text.strip():
+                results[
+                    "text_context"
+                ] += f"\n[FILE: {filename}] (Text Extracted)\n{extracted_text}\n"
+            else:
+                results["text_context"] += f"\n[FILE: {filename}] (No embedded text found)\n"
 
-            # FALLBACK: Convert to Images
-            print(f"PDF {filename} seems scanned/handwritten. Converting to images...")
-            results["text_context"] += f"\n[FILE: {filename}] (Scanned Document - See Images)\n"
-
-            # Convert pages to images (JPEG)
+            # Generate Images
+            print(f"Generating visual evidence for: {filename}")
             images = convert_from_path(file_path)
 
             for i, image in enumerate(images):
@@ -81,6 +81,7 @@ class EvidenceLoader:
 
                 # Add to results so AI service sees it
                 results["image_paths"].append(temp_path)
+
         except Exception as e:
             print(f"Failed to process PDF {filename}: {e}")
-            results["text_context"] += f"\n[FILE: {filename}] (Unreadable)\n"
+            results["text_context"] += f"\n[ERROR processing {filename}: {str(e)}]\n"

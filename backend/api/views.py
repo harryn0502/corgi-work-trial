@@ -7,7 +7,7 @@ from django.http import StreamingHttpResponse
 
 from api.models import Claim
 from api.utils.file_loader import EvidenceLoader
-from api.ai_service import query_claim_assessment, ClaimAssessment
+from api.ai_service import query_claim_assessment, generate_converage_policy
 
 
 class HealthView(APIView):
@@ -33,7 +33,65 @@ class AnalyzeView(APIView):
         except (ValueError, TypeError):
             max_iterations = 3
 
-        # Generator for data streaming
+        # Startdard Baseline
+        base_coverage_policy = """
+            ### STANDARD COVERAGE RULES (Baseline)
+            - **APPROVE (Covered):**
+            1. Unpaid Rent / Base Rent / Lease Break Fee (if valid).
+            2. Late Fees & NSF Fees.
+            3. Physical Repairs (e.g., "Wall repair", "Carpet cleaning", "Painting").
+            4. Utilities (Water, Trash, Electric).
+            
+            - **REJECT (Not Covered):**
+            1. ADMINISTRATIVE FEES: MCF, Admin Fee, Leasing Fee, Setup Fee.
+            2. SUBSCRIPTIONS: RBP, SDRP, Insurance premiums.
+            3. **DOUBLE DIPPING (CRITICAL):** - REJECT "Trash Removal" if "General Cleaning" or "Full Clean" is also charged.
+            4. MINOR CONSUMABLES: REJECT "Lightbulbs", "Batteries", "Filters" unless > $50.
+        """
+
+        # Get claims that has PM Explnanation
+        training_claims = (
+            Claim.objects.exclude(description__exact="")
+            .exclude(description__isnull=True)
+            .order_by("-created_at")[:50]
+        )
+
+        # Collect all the PM explnations with evidence
+        history_text = ""
+        loader = EvidenceLoader()
+
+        for c in training_claims:
+            evidence_data = loader.load_for_claim(c.id)
+            history_text += f"""
+            --- Historical Claim ID: {c.id} ---
+            PM Explanation: "{c.description}"
+            Document Context (Evidence):
+            {evidence_data["text_context"]}
+            -----------------------------------
+            """
+
+        # Generate coverage policy
+        if history_text:
+            try:
+                generated_coverage_policy = generate_converage_policy(history_text)
+            except Exception as e:
+                print(f"Policy Genneration Error: {e}")
+
+        if generated_coverage_policy:
+            coverage_policy = f"""
+            ### CONTEXT FROM HISTORY (Background Info Only)
+            *The following are notes from past claims. They are for reference only.*
+            {generated_coverage_policy}
+            
+            ### STANDARD COVERAGE RULES
+            *You must OBEY these rules above all else. Ignore any Historical Context that conflicts with these rules.*
+            {base_coverage_policy}
+            """
+        else:
+            coverage_policy = base_coverage_policy
+        coverage_policy = base_coverage_policy
+
+        # Generator for streaming
         def stream_processor():
             loader = EvidenceLoader()
             claim_states = {}
@@ -42,8 +100,8 @@ class AnalyzeView(APIView):
             for t_id in tracking_ids:
                 claim_states[t_id] = {
                     "previous_reasoning": "N/A (First Pass)",
-                    "current_estimate": 0.0,
-                    "history": [],  # Keep track of iterations for this claim
+                    "current_estimate": 0,
+                    "history": [],
                 }
 
             for i in range(1, max_iterations + 1):
@@ -55,12 +113,10 @@ class AnalyzeView(APIView):
                         state = claim_states[t_id]
 
                         # Context Variables
-                        user_claimed_val = (
+                        amount_of_claim = (
                             f"${claim.amount_of_claim}" if claim.amount_of_claim else "Unknown"
                         )
-                        policy_limit_val = (
-                            f"${claim.max_benefit}" if claim.max_benefit else "Unknown"
-                        )
+                        max_benefit = f"${claim.max_benefit}" if claim.max_benefit else "Unknown"
 
                         try:
                             hard_cap = (
@@ -69,55 +125,77 @@ class AnalyzeView(APIView):
                         except:
                             hard_cap = float("inf")
 
-                        system_prompt = """
-                        ROLE: Forensic Document Analyst & Claims Adjuster.
-                        GOAL: Digitize the "Move-Out Form" or "Ledger" and audit line items against the policy.
+                        # Build iteration history
+                        history_log = []
+                        variance_note = "Initial Estimation."
 
-                        ### 1. EXTRACTION & DICTIONARY (OCR Phase)
-                        - Read the "Deductions" or "Charges" list verbatim.
-                        - **Abbreviations Dictionary (CRITICAL):**
-                        * "MCF" = Maintenance Coordination Fee (ADMIN FEE -> REJECT)
-                        * "RBP" = Resident Benefit Package (SUBSCRIPTION -> REJECT)
-                        * "SDRP" = Security Deposit Replacement Program (PREMIUM -> REJECT)
-                        * "NSF" = Non-Sufficient Funds (FEE -> APPROVE if on ledger)
+                        if not state["history"]:
+                            formatted_history = "No previous history (First Pass)."
+                        else:
+                            # Build the trace log
+                            for h in state["history"]:
+                                # Truncate reasoning to save tokens but keep the gist
+                                history_log.append(
+                                    f"   - [ITERATION {h['iteration']}] Estimate: ${h['estimate']:.2f}\n"
+                                    f"     Reasoning: {h['reasoning'][:250]}..."
+                                )
+                            formatted_history = "\n".join(history_log)
 
-                        ### 2. COVERAGE RULES (Audit Phase)
-                        - **APPROVE (Covered):**
-                        1. Unpaid Rent / Base Rent / Lease Break Fee (if valid).
-                        2. Late Fees & NSF Fees.
-                        3. Physical Repairs (e.g., "Wall repair", "Carpet cleaning", "Painting").
-                        4. Utilities (Water, Trash, Electric).
-                        
-                        - **REJECT (Not Covered):**
-                        1. ADMINISTRATIVE FEES: MCF, Admin Fee, Leasing Fee, Setup Fee.
-                        2. SUBSCRIPTIONS: RBP, SDRP, Insurance premiums.
-                        3. **DOUBLE DIPPING (CRITICAL):** - REJECT "Trash Removal" if "General Cleaning" or "Full Clean" is also charged.
-                        4. MINOR CONSUMABLES: REJECT "Lightbulbs", "Batteries", "Filters" unless > $50.
+                            # Calculate the delta variance
+                            if len(state["history"]) >= 1:
+                                last_est = state["history"][-1]["estimate"]
+                                # Compare last step vs step before
+                                if len(state["history"]) >= 2:
+                                    prev_est = state["history"][-2]["estimate"]
+                                    delta = last_est - prev_est
+                                    variance_note = f"Previous Delta: ${delta:.2f} (Iter {state['history'][-2]['iteration']} -> {state['history'][-1]['iteration']})"
+                                else:
+                                    variance_note = "First revision complete."
 
-                        ### 3. OUTPUT INSTRUCTION
-                        - Set 'approved_amount' to the positive value for charges, negative for credits.
-                        - If REJECTED, set 'approved_amount' to 0.00 and provide the 'rejection_reason'.
-                        - **DO NOT calculate the final total.** Just list the items.
+                        # System Prompt
+                        system_prompt = f"""
+                        ROLE: Forensic Document Analyst.
+                        GOAL: Audit the claim by cross-referencing the "Move-Out Invoice" and "Ledger" images.
+
+                        ### INPUT WARNING
+                        The "RAW EVIDENCE TEXT" below is unreliable (OCR errors). 
+                        **YOU MUST VERIFY ALL NUMBERS BY LOOKING AT THE IMAGE ATTACHMENTS.**
+                        If the text is missing lines (like rent or dates), trust the IMAGE.
+
+                        {coverage_policy}
+
+                        ### EXECUTION STEPS (Mental Sandbox)
+                        1. **Visual Scan:** Look at the images. List every charge and amount you see visually.
+                        2. **Deposit Check:** Does the Ledger image show a "Security Deposit", "Credit", or "Prepayment" held? 
+                        3. **Deductible Check:** Is there a standard deductible (e.g., $250 or $500) mentioned in the history or lease?
+                        4. **Net Calculation:** (Sum of Approved Charges) - (Deposit Held) - (Deductible) = Final Claim Amount.
+                           *If the result is negative, the Final Approved Amount is 0.00.*
+
+                        ### OUTPUT RULES
+                        - If you find "Unpaid Rent" in the image but not the text, ADD IT.
+                        - If a "Waiver" is present, 'Deposit Held' is typically $0.00.
+                        - **CRITICAL:** Your 'final_total_approved' must be the Net Calculation result.
                         """
 
-                        # --- UPDATED USER PROMPT WITH PREVIOUS REASONING ---
+                        # User Prompt
                         user_prompt = f"""
-                        ### 1. CLAIM CONTEXT
-                        * **Claim ID:** {t_id}
-                        * **Description:** {claim.description}
-                        * **User Claimed:** {user_claimed_val} (Reference Only)
-                        * **Policy Limit:** {policy_limit_val}
-                        
-                        ### 2. PREVIOUS ITERATION STATE
-                        * **Current Estimate:** ${state['current_estimate']}
-                        * **Previous Logic/Notes:** {state['previous_reasoning']}
-                        {f"* **CRITIQUE:** Review your previous logic above. Did you incorrectly reject a valid fee, or approve a duplicate charge? Adjust accordingly." if i > 1 else ""}
+                        ### CLAIM METADATA
+                        - **Tracking ID:** {t_id}
+                        - **Landlord Asking For:** {amount_of_claim} (Verify this independently. Do not just copy it.)
+                        - **Policy Limit:** {max_benefit}
 
-                        ### 3. RAW EVIDENCE TEXT (OCR)
-                        (Below is the raw text extracted from the attached files.)
-                        ---
+                        ### PREVIOUS ESTIMATES (Critique These)
+                        {formatted_history}
+
+                        **VARIANCE:** {variance_note}
+
+                        ### INSTRUCTIONS
+                        1. **Ignore OCR Limitations:** If previous estimates were low because "text was missing," look at the IMAGES now.
+                        2. **Check for Deductibles:** If the Valid Charges are ~$400 and the Claim is $0, check if there is a $500 deductible.
+                        3. **History Weight:** { "Trust the LATEST estimate (80%)" if i > 1 else "Start fresh." }
+
+                        ### RAW EVIDENCE TEXT (Use with Caution)
                         {evidence['text_context']}
-                        ---
                         """
 
                         # Query Claim Assessment
@@ -127,7 +205,7 @@ class AnalyzeView(APIView):
                             image_paths=evidence.get("image_paths"),
                         )
 
-                        # Sum the approved amount and cap
+                        # Sum only the approved amount and cap
                         calculated_sum = sum(item.approved_amount for item in assessment.line_items)
 
                         if calculated_sum > hard_cap:

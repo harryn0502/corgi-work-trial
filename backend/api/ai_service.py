@@ -2,7 +2,7 @@ import os
 import base64
 import mimetypes
 from openai import OpenAI
-from typing import List, Optional
+from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -39,6 +39,30 @@ class ClaimAssessment(BaseModel):
     final_total_approved: float = Field(
         ...,
         description="The sum of all approved_amount fields, capped by the Policy Limit if necessary.",
+    )
+
+
+class AbbreviationItem(BaseModel):
+    code: str = Field(..., description="The abbreviation acronym (e.g., 'MCF')")
+    meaning: str = Field(
+        ..., description="The full definition (e.g., 'Maintenance Coordination Fee')"
+    )
+
+
+class PolicyRules(BaseModel):
+    abbreviations: List[AbbreviationItem] = Field(
+        ...,
+        description="List of found abbreviations and their meanings.",
+    )
+    approved_categories: List[str] = Field(
+        ..., description="List of categories or items that are explicitly COVERED/APPROVED."
+    )
+    rejected_categories: List[str] = Field(
+        ..., description="List of categories or items that are explicitly REJECTED/NOT COVERED."
+    )
+    formatted_rule_text: str = Field(
+        ...,
+        description="A clear, markdown-formatted string suitable for a System Prompt (e.g., '### COVERAGE RULES...').",
     )
 
 
@@ -88,3 +112,34 @@ def query_claim_assessment(user_prompt: str, system_prompt: str, image_paths: Li
         return response.output_parsed
     except Exception as e:
         raise RuntimeError(f"AI Service Failure: {str(e)}")
+
+
+def generate_converage_policy(history_summary):
+    system_prompt = """
+    ROLE: Insurance Policy Manager
+    GOAL: Analyze the provided "History of PM Explnations" and create a list of "Deposit Claim Coverage Policy"
+
+    OUTPUT REQUIREMENTS:
+    1. Identify all Abbreviations (e.g., MCF, RBP).
+    2. Identify what was APPROVED vs REJECTED.
+    3. Detect nuance (e.g., "Lightbulbs are rejected UNLESS > $50").
+    4. Generate a clean Markdown section titled "### GENERATED COVERAGE RULES" that instructs an AI how to audit future claims.
+    """
+
+    try:
+        response = client.responses.parse(
+            model="gpt-5.2",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"### HISTORY OF DECISIONS:\n{history_summary}"},
+            ],
+            text_format=PolicyRules,
+        )
+        return response.output_parsed.formatted_rule_text
+
+    except Exception as e:
+        print(f"Policy Generation Error: {e}")
+        return """
+        ### GENERATED COVERAGE RULES
+        - Apply reasonable rules
+        """
