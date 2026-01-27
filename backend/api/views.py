@@ -2,7 +2,7 @@ import json
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-
+from django.core.cache import cache  # Import Cache
 from django.http import StreamingHttpResponse
 
 from api.models import Claim
@@ -33,7 +33,7 @@ class AnalyzeView(APIView):
         except (ValueError, TypeError):
             max_iterations = 3
 
-        # Startdard Baseline
+        # Standard Baseline
         base_coverage_policy = """
             ### STANDARD COVERAGE RULES (Baseline)
             - **APPROVE (Covered):**
@@ -49,34 +49,42 @@ class AnalyzeView(APIView):
             4. MINOR CONSUMABLES: REJECT "Lightbulbs", "Batteries", "Filters" unless > $50.
         """
 
-        # Get claims that has PM Explnanation
-        training_claims = (
-            Claim.objects.exclude(description__exact="")
-            .exclude(description__isnull=True)
-            .order_by("-created_at")[:50]
-        )
+        # --- CACHING STRATEGY ---
+        POLICY_CACHE_KEY = "generated_insurance_policy_v1"
+        generated_coverage_policy = cache.get(POLICY_CACHE_KEY)
 
-        # Collect all the PM explnations with evidence
-        history_text = ""
-        loader = EvidenceLoader()
+        if not generated_coverage_policy:
+            # Get claims that has PM Explanation
+            training_claims = (
+                Claim.objects.exclude(description__exact="")
+                .exclude(description__isnull=True)
+                .order_by("-created_at")[:20]
+            )
 
-        for c in training_claims:
-            evidence_data = loader.load_for_claim(c.id)
-            history_text += f"""
-            --- Historical Claim ID: {c.id} ---
-            PM Explanation: "{c.description}"
-            Document Context (Evidence):
-            {evidence_data["text_context"]}
-            -----------------------------------
-            """
+            # Collect all the PM explanations with evidence
+            history_text = ""
+            loader = EvidenceLoader()
 
-        # Generate coverage policy
-        if history_text:
-            try:
-                generated_coverage_policy = generate_converage_policy(history_text)
-            except Exception as e:
-                print(f"Policy Genneration Error: {e}")
+            for c in training_claims:
+                evidence_data = loader.load_for_claim(c.id)
+                history_text += f"""
+                --- Historical Claim ID: {c.id} ---
+                PM Explanation: "{c.description}"
+                Document Context (Evidence):
+                {evidence_data["text_context"]}
+                -----------------------------------
+                """
 
+            # Generate coverage policy if history exists
+            if history_text:
+                try:
+                    generated_coverage_policy = generate_converage_policy(history_text)
+                    # Cache for 24 hours (86400 seconds)
+                    cache.set(POLICY_CACHE_KEY, generated_coverage_policy, timeout=86400)
+                except Exception as e:
+                    print(f"Policy Generation Error: {e}")
+
+        # Combine policies
         if generated_coverage_policy:
             coverage_policy = f"""
             ### CONTEXT FROM HISTORY (Background Info Only)
@@ -89,7 +97,6 @@ class AnalyzeView(APIView):
             """
         else:
             coverage_policy = base_coverage_policy
-        coverage_policy = base_coverage_policy
 
         # Generator for streaming
         def stream_processor():
@@ -101,6 +108,7 @@ class AnalyzeView(APIView):
                 claim_states[t_id] = {
                     "previous_reasoning": "N/A (First Pass)",
                     "current_estimate": 0,
+                    "last_confidence": 0.0,  # Track confidence
                     "history": [],
                 }
 
@@ -131,12 +139,12 @@ class AnalyzeView(APIView):
 
                         if not state["history"]:
                             formatted_history = "No previous history (First Pass)."
+                            history_weight_instruction = "Start fresh."
                         else:
                             # Build the trace log
                             for h in state["history"]:
-                                # Truncate reasoning to save tokens but keep the gist
                                 history_log.append(
-                                    f"   - [ITERATION {h['iteration']}] Estimate: ${h['estimate']:.2f}\n"
+                                    f"   - [ITERATION {h['iteration']}] Estimate: ${h['estimate']:.2f} (Conf: {int(h['confidence']*100)}%)\n"
                                     f"     Reasoning: {h['reasoning'][:250]}..."
                                 )
                             formatted_history = "\n".join(history_log)
@@ -144,13 +152,24 @@ class AnalyzeView(APIView):
                             # Calculate the delta variance
                             if len(state["history"]) >= 1:
                                 last_est = state["history"][-1]["estimate"]
-                                # Compare last step vs step before
                                 if len(state["history"]) >= 2:
                                     prev_est = state["history"][-2]["estimate"]
                                     delta = last_est - prev_est
-                                    variance_note = f"Previous Delta: ${delta:.2f} (Iter {state['history'][-2]['iteration']} -> {state['history'][-1]['iteration']})"
+                                    variance_note = f"Previous Delta: ${delta:.2f}"
                                 else:
                                     variance_note = "First revision complete."
+
+                            # --- CONFIDENCE WEIGHTING LOGIC ---
+                            # If previous confidence was high, instruct AI to trust it more.
+                            prev_conf = state["last_confidence"]
+                            trust_pct = int(prev_conf * 100)
+
+                            if prev_conf > 0.8:
+                                history_weight_instruction = f"Trust the LATEST estimate significantly ({trust_pct}% confidence). Only change if you find critical new evidence."
+                            elif prev_conf > 0.5:
+                                history_weight_instruction = f"Consider the LATEST estimate ({trust_pct}% confidence), but verify carefully."
+                            else:
+                                history_weight_instruction = f"The previous estimate had low confidence ({trust_pct}%). Review the evidence from scratch."
 
                         # System Prompt
                         system_prompt = f"""
@@ -192,7 +211,7 @@ class AnalyzeView(APIView):
                         ### INSTRUCTIONS
                         1. **Ignore OCR Limitations:** If previous estimates were low because "text was missing," look at the IMAGES now.
                         2. **Check for Deductibles:** If the Valid Charges are ~$400 and the Claim is $0, check if there is a $500 deductible.
-                        3. **History Weight:** { "Trust the LATEST estimate (80%)" if i > 1 else "Start fresh." }
+                        3. **History Weight:** {history_weight_instruction}
 
                         ### RAW EVIDENCE TEXT (Use with Caution)
                         {evidence['text_context']}
@@ -223,6 +242,7 @@ class AnalyzeView(APIView):
                         iteration_data = {
                             "iteration": i,
                             "estimate": estimation,
+                            "confidence": assessment.confidence_score,  # Add confidence
                             "reasoning": reasoning_text,
                             "line_items": [item.model_dump() for item in assessment.line_items],
                             "summary": assessment.summary_of_evidence,
@@ -231,13 +251,14 @@ class AnalyzeView(APIView):
                         # Update the state
                         state["previous_reasoning"] = assessment.policy_check_notes
                         state["current_estimate"] = estimation
+                        state["last_confidence"] = assessment.confidence_score  # Update tracking
                         state["history"].append(iteration_data)
 
                         # Update DB
                         claim.estimated_amount = estimation
                         claim.ai_reasoning = state["history"]
 
-                        # Update Explanation (similar to PM Explnation) only on last step or generally
+                        # Update Explanation only on last step
                         if i == max_iterations:
                             summary_lines = [f"Summary: {assessment.summary_of_evidence}"]
                             for item in iteration_data["line_items"]:

@@ -34,12 +34,18 @@ export default function Graph({ results }: GraphProps) {
       const errorsAtStep = results.map((r) => {
         const iter = r.iterations.find((it) => it.iteration === currentIterNum);
 
-        // If this iteration exists, calculate error % vs ground truth
-        if (iter && r.ground_truth > 0) {
+        if (iter) {
+          // Ground Truth is 0
+          if (r.ground_truth === 0) {
+            return iter.estimate === 0 ? 0 : 100;
+          }
+
+          // Standard calculation
           const diff = Math.abs(iter.estimate - r.ground_truth);
           return (diff / r.ground_truth) * 100;
         }
-        return 0; // fallback if no iteration or div by zero
+
+        return 0;
       });
 
       // Calculate Average for the graph point

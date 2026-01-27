@@ -12,6 +12,7 @@ import {
   Typography,
   Chip,
   Paper,
+  LinearProgress,
 } from "@mui/material";
 import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 import KeyboardArrowUpIcon from "@mui/icons-material/KeyboardArrowUp";
@@ -33,7 +34,6 @@ function Row({ row }: { row: Results }) {
   // Calculate Signed Error %
   const calculateError = (estimate: number, truth: number) => {
     if (truth === 0) {
-      // If truth is 0 and estimate is > 0, strictly it's infinite, but we can cap it or show 100%
       return estimate === 0 ? 0 : 100;
     }
     return ((estimate - truth) / truth) * 100;
@@ -100,20 +100,30 @@ function Row({ row }: { row: Results }) {
                 <MuiTable size="small" aria-label="iterations">
                   <TableHead>
                     <TableRow sx={{ backgroundColor: "action.hover" }}>
-                      <TableCell width="10%">Step</TableCell>
-                      <TableCell align="right" width="15%">
+                      <TableCell width="8%">Step</TableCell>
+                      <TableCell align="right" width="12%">
                         Estimate
                       </TableCell>
-                      <TableCell align="right" width="15%">
+                      <TableCell align="center" width="15%">
+                        Confidence
+                      </TableCell>
+                      <TableCell align="right" width="10%">
                         Error Rate
                       </TableCell>
-                      <TableCell width="60%">Reasoning</TableCell>
+                      <TableCell width="55%">Reasoning</TableCell>
                     </TableRow>
                   </TableHead>
                   <TableBody>
                     {row.iterations.map((iter) => {
                       const signedError = calculateError(iter.estimate, row.ground_truth);
-                      const absError = Math.abs(signedError); // Used for color logic
+                      const absError = Math.abs(signedError);
+                      // Handle missing confidence for backward compatibility
+                      const confidenceVal = iter.confidence ?? 0;
+                      const confidencePct = Math.round(confidenceVal * 100);
+
+                      let confColor: "success" | "warning" | "error" = "error";
+                      if (confidenceVal > 0.8) confColor = "success";
+                      else if (confidenceVal > 0.5) confColor = "warning";
 
                       return (
                         <TableRow key={iter.iteration}>
@@ -123,12 +133,23 @@ function Row({ row }: { row: Results }) {
                           <TableCell align="right" sx={{ fontWeight: "medium" }}>
                             ${iter.estimate.toLocaleString()}
                           </TableCell>
+                          <TableCell align="center">
+                            <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                              <LinearProgress
+                                variant="determinate"
+                                value={confidencePct}
+                                color={confColor}
+                                sx={{ width: "100%", minWidth: 50, borderRadius: 5, height: 8 }}
+                              />
+                              <Typography variant="caption" fontWeight="bold">
+                                {confidencePct}%
+                              </Typography>
+                            </Box>
+                          </TableCell>
                           <TableCell align="right">
                             <Chip
-                              // Display: "+10%" or "-5.5%"
                               label={`${signedError > 0 ? "+" : ""}${signedError.toFixed(1)}%`}
                               size="small"
-                              // Color Logic: 0 is Green, Small diff is Orange, Big diff is Red
                               color={
                                 absError === 0 ? "success" : absError < 20 ? "warning" : "error"
                               }

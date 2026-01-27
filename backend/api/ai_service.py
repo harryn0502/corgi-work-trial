@@ -29,6 +29,10 @@ class LineItem(BaseModel):
 
 
 class ClaimAssessment(BaseModel):
+    confidence_score: float = Field(
+        ...,
+        description="A generic score from 0.0 to 1.0 representing how confident you are in this assessment based on evidence clarity.",
+    )
     summary_of_evidence: str = Field(
         ..., description="A brief summary of the valid receipts and documents found."
     )

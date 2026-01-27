@@ -1,6 +1,7 @@
 export interface Iteration {
   iteration: number;
   estimate: number;
+  confidence: number;
   reasoning: string;
 }
 
