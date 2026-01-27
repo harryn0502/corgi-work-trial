@@ -208,6 +208,8 @@ __marimo__/
 
 # Files
 .DS_Store
+todo.md
+change.log
 
 # Data
 data/

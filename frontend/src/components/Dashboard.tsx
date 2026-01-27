@@ -63,7 +63,7 @@ export default function Dashboard() {
         <Box display="flex" alignItems="center" mb={3}>
           <AnalyticsIcon color="primary" sx={{ fontSize: 40, mr: 2 }} />
           <Typography variant="h4" component="h1" fontWeight="bold" color="text.primary">
-            AI Analyzer
+            Deposit Claim Estimator
           </Typography>
         </Box>
 

@@ -7,3 +7,4 @@ openai
 pandas
 pypdf
 python-docx
+pdf2image

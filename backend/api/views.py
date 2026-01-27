@@ -1,11 +1,10 @@
-import json
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 
 from api.models import Claim
 from api.utils.file_loader import EvidenceLoader
-from api.ai_service import query_ai
+from api.ai_service import query_claim_assessment, ClaimAssessment
 
 
 class HealthView(APIView):
@@ -15,25 +14,22 @@ class HealthView(APIView):
 
 class AnalyzeView(APIView):
     def post(self, request):
-        # Get tracking numbers and split them into each number
+        # 1. Get tracking numbers
         raw_ids = request.data.get("tracking_numbers", "")
         tracking_ids = [x.strip() for x in raw_ids.split(",") if x.strip()]
 
         if not tracking_ids:
             return Response(
-                {
-                    "error": "No tracking numbers provided. Please send a comma-separated list (e.g., '1, 2, 3')."
-                },
+                {"error": "No tracking numbers provided."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Get iteration count (default: 3)
+        # 2. Get iteration count
         try:
             max_iterations = int(request.data.get("iteration_count", 3))
         except (ValueError, TypeError):
             max_iterations = 3
 
-        # Prepare the anaylzed result
         loader = EvidenceLoader()
         results = []
 
@@ -43,63 +39,137 @@ class AnalyzeView(APIView):
                 claim = Claim.objects.get(id=t_id)
                 evidence = loader.load_for_claim(t_id)
 
-                # Prepare Loop
-                iterations = []
-                current_estimate = 0
+                iterations_log = []
+                current_estimate = 0.0
+                previous_reasoning = "N/A (First Pass)"
 
-                # Context formatting
-                max_benefit = f"${claim.max_benefit}" if claim.max_benefit else "Unknown"
-                amount_of_claim = (
+                # --- Context Preparation ---
+                user_claimed_val = (
                     f"${claim.amount_of_claim}" if claim.amount_of_claim else "Unknown"
                 )
+                policy_limit_val = f"${claim.max_benefit}" if claim.max_benefit else "Unknown"
+
+                try:
+                    hard_cap = float(claim.max_benefit) if claim.max_benefit else float("inf")
+                except:
+                    hard_cap = float("inf")
 
                 # Iteration Loop
                 for i in range(1, max_iterations + 1):
-                    prompt = f"""
-                    Iteration {i} of {max_iterations}.
-                    ROLE: Senior Insurance Adjuster.
-                    GOAL: Determine the 'Approved Benefit Amount' (Ground Truth).
+
+                    system_prompt = """
+                    ROLE: Forensic Document Analyst & Claims Adjuster.
+                    GOAL: Digitize the "Move-Out Form" or "Ledger" and audit line items against the policy.
+
+                    ### 1. EXTRACTION & DICTIONARY (OCR Phase)
+                    - Read the "Deductions" or "Charges" list verbatim.
+                    - **Abbreviations Dictionary (CRITICAL):**
+                      * "MCF" = Maintenance Coordination Fee (ADMIN FEE -> REJECT)
+                      * "RBP" = Resident Benefit Package (SUBSCRIPTION -> REJECT)
+                      * "SDRP" = Security Deposit Replacement Program (PREMIUM -> REJECT)
+                      * "NSF" = Non-Sufficient Funds (FEE -> APPROVE if on ledger)
+
+                    ### 2. COVERAGE RULES (Audit Phase)
+                    - **APPROVE (Covered):**
+                      1. Unpaid Rent / Base Rent / Lease Break Fee (if valid).
+                      2. Late Fees & NSF Fees.
+                      3. Physical Repairs (e.g., "Wall repair", "Carpet cleaning", "Painting").
+                      4. Utilities (Water, Trash, Electric).
                     
-                    CLAIM CONTEXT:
-                    - ID: {t_id}
-                    - PM Description: {claim.description}
-                    - Amount User Claimed: {max_benefit} (You likely cannot exceed this)
-                    - Max Benefit Policy: {amount_of_claim} (You ABSOLUTELY cannot exceed this)
-                    
-                    EVIDENCE FILES:
-                    {evidence['text_context']}
-                    
-                    PREVIOUS ESTIMATE: ${current_estimate}
-                    {f'Critique the previous guess. If it is 0, start fresh.' if i > 1 else ''}
-                    
-                    OUTPUT JSON ONLY: {{ "amount": 100.00, "reasoning": "Brief explanation" }}
+                    - **REJECT (Not Covered):**
+                      1. ADMINISTRATIVE FEES: MCF, Admin Fee, Leasing Fee, Setup Fee.
+                      2. SUBSCRIPTIONS: RBP, SDRP, Insurance premiums.
+                      3. **DOUBLE DIPPING (CRITICAL):** - REJECT "Trash Removal" if "General Cleaning" or "Full Clean" is also charged.
+                      4. MINOR CONSUMABLES: REJECT "Lightbulbs", "Batteries", "Filters" unless > $50.
+
+                    ### 3. OUTPUT INSTRUCTION
+                    - Set 'approved_amount' to the positive value for charges, negative for credits.
+                    - If REJECTED, set 'approved_amount' to 0.00 and provide the 'rejection_reason'.
+                    - **DO NOT calculate the final total.** Just list the items.
                     """
 
-                    # Query AI
-                    response_text = query_ai(prompt, image_paths=evidence["image_paths"])
+                    # --- UPDATED USER PROMPT WITH PREVIOUS REASONING ---
+                    user_prompt = f"""
+                    ### 1. CLAIM CONTEXT
+                    * **Claim ID:** {t_id}
+                    * **Description:** {claim.description}
+                    * **User Claimed:** {user_claimed_val} (Reference Only)
+                    * **Policy Limit:** {policy_limit_val}
+                    
+                    ### 2. PREVIOUS ITERATION STATE
+                    * **Current Estimate:** ${current_estimate}
+                    * **Previous Logic/Notes:** {previous_reasoning}
+                    {f"* **CRITIQUE:** Review your previous logic above. Did you incorrectly reject a valid fee, or approve a duplicate charge? Adjust accordingly." if i > 1 else ""}
+
+                    ### 3. RAW EVIDENCE TEXT (OCR)
+                    (Below is the raw text extracted from the attached files.)
+                    ---
+                    {evidence['text_context']}
+                    ---
+                    """
 
                     try:
-                        data = json.loads(response_text)
-                        estimation = float(data.get("amount", 0))
-                        reasoning = data.get("reasoning", "")
-                    except:
-                        estimation = 0
-                        reasoning = "Failed to parse JSON"
+                        # Query Claim Assessment
+                        assessment: ClaimAssessment = query_claim_assessment(
+                            user_prompt=user_prompt,
+                            system_prompt=system_prompt,
+                            image_paths=evidence.get("image_paths"),
+                        )
 
-                    iterations.append(
-                        {
+                        # Sum the Line Items
+                        calculated_sum = sum(item.approved_amount for item in assessment.line_items)
+
+                        # Apply the Hard Cap
+                        if calculated_sum > hard_cap:
+                            estimation = hard_cap
+                            reasoning_text = f"{assessment.policy_check_notes} [CAPPED: ${calculated_sum:.2f} > Limit ${hard_cap:.2f}]"
+                        else:
+                            estimation = calculated_sum
+                            reasoning_text = assessment.policy_check_notes
+
+                        if estimation < 0:
+                            estimation = 0.0
+                            reasoning_text += " [NOTE: Net balance is negative. Claim set to $0.00]"
+
+                        iteration_data = {
                             "iteration": i,
                             "estimate": estimation,
-                            "reasoning": reasoning,
+                            "reasoning": reasoning_text,
+                            "line_items": [item.model_dump() for item in assessment.line_items],
+                            "summary": assessment.summary_of_evidence,
                         }
-                    )
+
+                        # Update the reasoning state for the next loop
+                        previous_reasoning = assessment.policy_check_notes
+
+                    except Exception as e:
+                        estimation = 0.0
+                        reasoning_text = f"AI Service Error: {str(e)}"
+                        iteration_data = {
+                            "iteration": i,
+                            "estimate": 0.0,
+                            "reasoning": reasoning_text,
+                            "error": str(e),
+                        }
+                        previous_reasoning = f"Error in previous step: {str(e)}"
+
+                    iterations_log.append(iteration_data)
                     current_estimate = estimation
 
-                # Add to results
+                # Save to Database
                 claim.estimated_amount = current_estimate
-                claim.ai_reasoning = iterations
-                if iterations:
-                    claim.ai_explanation = iterations[-1].get("reasoning", "")
+                claim.ai_reasoning = iterations_log
+
+                if iterations_log:
+                    last_iter = iterations_log[-1]
+                    summary_lines = [f"Summary: {last_iter.get('summary', 'No summary')}"]
+                    if "line_items" in last_iter:
+                        for item in last_iter["line_items"]:
+                            summary_lines.append(
+                                f"- {item['item_name']}: ${item['claimed_amount']} -> ${item['approved_amount']}"
+                            )
+                    claim.ai_explanation = "\n".join(summary_lines)
+
                 claim.status = "SUCCESS"
                 claim.save()
 
@@ -107,7 +177,8 @@ class AnalyzeView(APIView):
                     {
                         "tracking_number": t_id,
                         "ground_truth": claim.ground_truth_amount,
-                        "iterations": iterations,
+                        "estimated_amount": current_estimate,
+                        "iterations": iterations_log,
                     }
                 )
 

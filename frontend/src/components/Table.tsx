@@ -28,8 +28,16 @@ function Row({ row }: { row: Results }) {
   const finalEstimate = finalIteration ? finalIteration.estimate : 0;
 
   const diff = finalEstimate - row.ground_truth;
-  // Consider it a "Match" if difference is negligible (floating point safety)
   const isMatch = Math.abs(diff) < 0.01;
+
+  // Calculate Signed Error %
+  const calculateError = (estimate: number, truth: number) => {
+    if (truth === 0) {
+      // If truth is 0 and estimate is > 0, strictly it's infinite, but we can cap it or show 100%
+      return estimate === 0 ? 0 : 100;
+    }
+    return ((estimate - truth) / truth) * 100;
+  };
 
   return (
     <React.Fragment>
@@ -92,25 +100,48 @@ function Row({ row }: { row: Results }) {
                 <MuiTable size="small" aria-label="iterations">
                   <TableHead>
                     <TableRow sx={{ backgroundColor: "action.hover" }}>
-                      <TableCell>Step</TableCell>
-                      <TableCell align="right">Estimate</TableCell>
-                      <TableCell>Reasoning</TableCell>
+                      <TableCell width="10%">Step</TableCell>
+                      <TableCell align="right" width="15%">
+                        Estimate
+                      </TableCell>
+                      <TableCell align="right" width="15%">
+                        Error Rate
+                      </TableCell>
+                      <TableCell width="60%">Reasoning</TableCell>
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {row.iterations.map((iter) => (
-                      <TableRow key={iter.iteration}>
-                        <TableCell component="th" scope="row" width={80}>
-                          Iter {iter.iteration}
-                        </TableCell>
-                        <TableCell align="right" width={120}>
-                          ${iter.estimate.toLocaleString()}
-                        </TableCell>
-                        <TableCell sx={{ color: "text.secondary", fontSize: "0.875rem" }}>
-                          {iter.reasoning}
-                        </TableCell>
-                      </TableRow>
-                    ))}
+                    {row.iterations.map((iter) => {
+                      const signedError = calculateError(iter.estimate, row.ground_truth);
+                      const absError = Math.abs(signedError); // Used for color logic
+
+                      return (
+                        <TableRow key={iter.iteration}>
+                          <TableCell component="th" scope="row">
+                            Iter {iter.iteration}
+                          </TableCell>
+                          <TableCell align="right" sx={{ fontWeight: "medium" }}>
+                            ${iter.estimate.toLocaleString()}
+                          </TableCell>
+                          <TableCell align="right">
+                            <Chip
+                              // Display: "+10%" or "-5.5%"
+                              label={`${signedError > 0 ? "+" : ""}${signedError.toFixed(1)}%`}
+                              size="small"
+                              // Color Logic: 0 is Green, Small diff is Orange, Big diff is Red
+                              color={
+                                absError === 0 ? "success" : absError < 20 ? "warning" : "error"
+                              }
+                              variant={absError === 0 ? "filled" : "outlined"}
+                              sx={{ height: 20, fontSize: "0.75rem", fontWeight: "bold" }}
+                            />
+                          </TableCell>
+                          <TableCell sx={{ color: "text.secondary", fontSize: "0.875rem" }}>
+                            {iter.reasoning}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
                   </TableBody>
                 </MuiTable>
               </TableContainer>
